@@ -1,0 +1,246 @@
+import * as Promise from 'bluebird';
+import { runPatcher } from 'harmony-patcher';
+import * as path from 'path';
+import { fs, log, selectors, types, util } from 'vortex-api';
+
+import { IGameStoredInfo, IPatcherDetails, ISortedEntries } from './types';
+
+const MODULE_PATH = path.join(util.getVortexPath('modules_unpacked'), 'harmony-patcher', 'dist');
+const DEFAULT_UNITY_ASSEMBLY: string = 'Assembly-CSharp.dll';
+
+// The Harmony patcher modtype relies on game extensions to provide it with all
+//  the required information to attempt to run the harmony patcher
+//  automatically. This can be done using the details object when
+//  registering a game e.g. registerGame(... details: { harmonyPatchDetails: { ... } }).
+const DETAILS_PATCH_TARGET: string = 'harmonyPatchDetails';
+
+const FAKE_FILE: string = '__harmony_merge_fake_file';
+
+function getCurrentGameInfo(context: types.IExtensionContext): IGameStoredInfo {
+  const state: any = context.api.store.getState();
+  if (state === undefined) {
+    return undefined;
+  }
+
+  const game: types.IGameStored = selectors.currentGame(state);
+  if (game === undefined) {
+    return undefined;
+  }
+
+  const discovery: types.IDiscoveryResult = util.getSafe(state,
+    ['settings', 'gameMode', 'discovered', game.id], undefined);
+
+  if ((discovery === undefined) || (discovery.path === undefined)) {
+      return undefined;
+  }
+
+  return { game, discoveryPath: discovery.path };
+}
+
+function test(instructions: types.IInstruction[],
+              context: types.IExtensionContext): Promise<boolean> {
+  const gameInfo = getCurrentGameInfo(context);
+  if (gameInfo === undefined) {
+    return Promise.resolve(false);
+  }
+
+  const patcherDetails: IPatcherDetails = getPatcherDetails(gameInfo.game);
+  if (patcherDetails === undefined) {
+    return Promise.resolve(false);
+  }
+
+  const dataPath: string = path.join(gameInfo.discoveryPath, path.dirname(patcherDetails.dataPath));
+  const modHasDll = (instructions.find((instr: types.IInstruction) =>
+                    (instr.type === 'copy')
+                  && instr.source.endsWith('.dll')) !== undefined);
+
+  return fs.readdirAsync(dataPath).then(entries => {
+    const filtered = entries.filter(entry => entry.startsWith('UnityEngine'));
+    return ((filtered.length > 0) && modHasDll)
+      ? Promise.resolve(true)
+      : Promise.resolve(false);
+  });
+}
+
+function getPatcherDetails(game: types.IGame | types.IGameStored): IPatcherDetails {
+  if (!!game.details && !!game.details[DETAILS_PATCH_TARGET]) {
+    try {
+      const stringified: string = JSON.stringify(game.details[DETAILS_PATCH_TARGET]);
+      const patchDetails: IPatcherDetails = JSON.parse(stringified);
+      patchDetails.dataPath = (!patchDetails.dataPath.endsWith('.dll'))
+        ? path.join(patchDetails.dataPath, DEFAULT_UNITY_ASSEMBLY)
+        : patchDetails.dataPath;
+
+      return patchDetails;
+    } catch (err) {
+      log('error', 'invalid patcher details provided', err);
+    }
+  }
+  return undefined;
+}
+
+function merge(filePath: string,
+               mergeDir: string,
+               context: types.IExtensionContext): Promise<void> {
+  const gameInfo = getCurrentGameInfo(context);
+  if (gameInfo === undefined) {
+    // How the heck is this possible ?
+    return Promise.reject(new util.NotFound('Not actively managing any game'));
+  }
+
+  // We don't want to replace any pre-existing libraries which the game is using.
+  //  getGameAssemblies will return only non-symlinks.
+  const getGameAssemblies = (unityDataPath: string): Promise<string[]> => {
+    return fs.readdirAsync(unityEnginePath)
+      .then(entries => {
+        const filtered = entries.filter(entry => entry.endsWith('.dll'));
+        return Promise.reduce(filtered, (accumulator, entry) => {
+          return fs.lstatAsync(path.join(unityDataPath, entry))
+            .then(stats => {
+              if (!stats.isSymbolicLink()) {
+                accumulator.push(entry);
+              }
+              return accumulator;
+            })
+            .catch(err => accumulator);
+        }, []);
+      });
+  };
+
+  const deployAssemblies = (relDataPath: string, unityDataPath: string) => {
+    relDataPath = relDataPath.endsWith('.dll') ? path.dirname(relDataPath) : relDataPath;
+    const assemblyPath = path.join(mergeDir, relDataPath);
+    return Promise.all([fs.readdirAsync(MODULE_PATH),
+                        fs.readdirAsync(assemblyPath),
+                        getGameAssemblies(unityDataPath)])
+      .then((res) => {
+        // Filter for: any dll file which isn't a system dll EXCEPT
+        //  the runtime serialization dll which is used by our json
+        //  parsing lib.
+        const modulePathAssemblies: string[] = res[0].filter(x =>
+                      (x.endsWith('.dll') && !x.startsWith('System'))
+                   || (x === 'System.Runtime.Serialization.dll'));
+
+        const diff: string[] = (modulePathAssemblies.filter(x => !res[1].includes(x)
+                                                              && !res[2].includes(x)));
+        return Promise.resolve(diff);
+      })
+      .then(assemblies => (assemblies.length > 0)
+        ? Promise.each(assemblies, assembly =>
+          fs.copyAsync(path.join(MODULE_PATH, assembly),
+                       path.join(mergeDir, relDataPath, assembly)))
+        : Promise.resolve([]));
+  };
+
+  const patcherDetails: IPatcherDetails = getPatcherDetails(gameInfo.game);
+  const dataPath: string = path.join(gameInfo.discoveryPath, patcherDetails.dataPath);
+  const modsPath: string = path.join(gameInfo.discoveryPath, patcherDetails.modsPath);
+  const mergedFilePath: string = path.join(mergeDir, patcherDetails.dataPath);
+  const unityEnginePath: string = dataPath.endsWith('.dll') ? path.dirname(dataPath) : dataPath;
+  return fs.statAsync(mergedFilePath)
+    .then(() => deployAssemblies(patcherDetails.dataPath, unityEnginePath))
+    .then(() => runPatcher(gameInfo.game.extensionPath,
+                           mergedFilePath,
+                           patcherDetails.entryPoint,
+                           false,
+                           modsPath,
+                           context as any,
+                           patcherDetails.injectVIGO,
+                           unityEnginePath));
+}
+
+function canMerge(game: types.IGame, gameDiscovery: types.IDiscoveryResult): types.IMergeFilter {
+  const patcherDetails: IPatcherDetails = getPatcherDetails(game);
+  return (patcherDetails === undefined)
+    ? undefined
+    : ({
+      baseFiles: () => [
+        {
+          in: path.join(gameDiscovery.path, patcherDetails.dataPath),
+          out: patcherDetails.dataPath,
+        },
+      ],
+      filter: filePath => filePath.indexOf(FAKE_FILE) !== -1,
+    });
+}
+
+function getDiscoveryPath(context: types.IExtensionContext, gameId: string): string {
+  const store: types.ThunkStore<any> = context.api.store;
+  const state: any = store.getState();
+  const discovery: types.IDiscoveryResult = util.getSafe(state,
+    ['settings', 'gameMode', 'discovered', gameId], undefined);
+  return (!!discovery && !!discovery.path)
+    ? discovery.path : undefined;
+}
+
+function testInstaller(files: string[],
+                       gameId: string,
+                       context: types.IExtensionContext): Promise<types.ISupportedResult> {
+  const gameInfo = getCurrentGameInfo(context);
+  if (gameInfo === undefined) {
+    // How the heck is this possible ?
+    return Promise.reject(new util.NotFound('Not actively managing any game'));
+  }
+
+  const game: types.IGameStored = gameInfo.game;
+  if ((game === undefined) || (game.id !== gameId)) {
+    return Promise.resolve({ supported: false, requiredFiles: [] });
+  }
+
+  const modHasDll = (files.find((file: string) => file.endsWith('.dll')) !== undefined);
+
+  return Promise.resolve({ supported: modHasDll, requiredFiles: [] });
+}
+
+function install(files: string[],
+                 destinationPath: string,
+                 gameId: string,
+                 progressDelegate: types.ProgressDelegate,
+                 context: types.IExtensionContext): Promise<types.IInstallResult> {
+  const gameInfo = getCurrentGameInfo(context);
+  if (gameInfo === undefined) {
+    // How the heck is this possible ?
+    return Promise.reject(new util.NotFound('Not actively managing any game'));
+  }
+
+  const patcherDetails: IPatcherDetails = getPatcherDetails(gameInfo.game);
+  const instructions: types.IInstruction[] = files
+    .filter(file => path.extname(file) !== '')
+    .map(file => ({
+      type: ('copy' as any), // pfft - Type 'string' is not assignable to type 'InstructionType'
+      source: file,
+      destination: path.join(patcherDetails.modsPath, file),
+  }));
+
+  instructions.push({
+    type: 'generatefile',
+    destination: path.join(patcherDetails.modsPath, FAKE_FILE),
+    data: new Buffer('generated via vortex'),
+  });
+
+  return Promise.resolve({ instructions });
+}
+
+function init(context: types.IExtensionContext) {
+  const getPath = (game: types.IGame) => {
+    const discoveryPath: string = getDiscoveryPath(context, game.id);
+    return (discoveryPath !== undefined) ? discoveryPath : undefined;
+  };
+
+  context.registerModType('harmonypatchermod', 25, () => true, getPath,
+    (instructions: types.IInstruction[]) => test(instructions, context));
+
+  context.registerMerge(canMerge,
+    (filePath: string, mergeDir: string) =>
+      merge(filePath, mergeDir, context), 'harmonypatchermod');
+
+  context.registerInstaller('harmonypatchermod', 25,
+    (files: string[], gameId: string) => testInstaller(files, gameId, context),
+    (files: string[], destinationPath: string,
+     gameId: string, progressDelegate: types.ProgressDelegate) =>
+      install(files, destinationPath, gameId, progressDelegate, context));
+
+  return true;
+}
+
+export default init;
