@@ -1,9 +1,11 @@
 import * as Promise from 'bluebird';
 import { runPatcher } from 'harmony-patcher';
 import * as path from 'path';
-import { fs, log, selectors, types, util } from 'vortex-api';
+import { actions, fs, log, selectors, types, util } from 'vortex-api';
 
-import { IGameStoredInfo, IPatcherDetails, ISortedEntries } from './types';
+import { FAKE_FILE, IDeployment, IGameStoredInfo, IPatcherDetails, ISortedEntries } from './types';
+
+import ensureHarmonyMod from './harmonymod';
 
 const MODULE_PATH = path.join(util.getVortexPath('modules_unpacked'), 'harmony-patcher', 'dist');
 const DEFAULT_UNITY_ASSEMBLY: string = 'Assembly-CSharp.dll';
@@ -13,8 +15,6 @@ const DEFAULT_UNITY_ASSEMBLY: string = 'Assembly-CSharp.dll';
 //  automatically. This can be done using the details object when
 //  registering a game e.g. registerGame(... details: { harmonyPatchDetails: { ... } }).
 const DETAILS_PATCH_TARGET: string = 'harmonyPatchDetails';
-
-const FAKE_FILE: string = '__harmony_merge_fake_file';
 
 function getCurrentGameInfo(context: types.IExtensionContext): IGameStoredInfo {
   const state: any = context.api.store.getState();
@@ -49,17 +49,10 @@ function test(instructions: types.IInstruction[],
     return Promise.resolve(false);
   }
 
-  const dataPath: string = path.join(gameInfo.discoveryPath, path.dirname(patcherDetails.dataPath));
-  const modHasDll = (instructions.find((instr: types.IInstruction) =>
-                    (instr.type === 'copy')
-                  && instr.source.endsWith('.dll')) !== undefined);
+  const isHarmonyPatcherMod = instructions.find((instr: types.IInstruction) =>
+    instr.source.indexOf(FAKE_FILE) !== -1) !== undefined;
 
-  return fs.readdirAsync(dataPath).then(entries => {
-    const filtered = entries.filter(entry => entry.startsWith('UnityEngine'));
-    return ((filtered.length > 0) && modHasDll)
-      ? Promise.resolve(true)
-      : Promise.resolve(false);
-  });
+  return Promise.resolve(isHarmonyPatcherMod);
 }
 
 function getPatcherDetails(game: types.IGame | types.IGameStored): IPatcherDetails {
@@ -173,72 +166,60 @@ function getDiscoveryPath(context: types.IExtensionContext, gameId: string): str
     ? discovery.path : undefined;
 }
 
-function testInstaller(files: string[],
-                       gameId: string,
-                       context: types.IExtensionContext): Promise<types.ISupportedResult> {
-  const gameInfo = getCurrentGameInfo(context);
-  if (gameInfo === undefined) {
-    // How the heck is this possible ?
-    return Promise.reject(new util.NotFound('Not actively managing any game'));
-  }
-
-  const game: types.IGameStored = gameInfo.game;
-  if ((game === undefined) || (game.id !== gameId)) {
-    return Promise.resolve({ supported: false, requiredFiles: [] });
-  }
-
-  const modHasDll = (files.find((file: string) => file.endsWith('.dll')) !== undefined);
-
-  return Promise.resolve({ supported: modHasDll, requiredFiles: [] });
-}
-
-function install(files: string[],
-                 destinationPath: string,
-                 gameId: string,
-                 progressDelegate: types.ProgressDelegate,
-                 context: types.IExtensionContext): Promise<types.IInstallResult> {
-  const gameInfo = getCurrentGameInfo(context);
-  if (gameInfo === undefined) {
-    // How the heck is this possible ?
-    return Promise.reject(new util.NotFound('Not actively managing any game'));
-  }
-
-  const patcherDetails: IPatcherDetails = getPatcherDetails(gameInfo.game);
-  const instructions: types.IInstruction[] = files
-    .filter(file => path.extname(file) !== '')
-    .map(file => ({
-      type: ('copy' as any), // pfft - Type 'string' is not assignable to type 'InstructionType'
-      source: file,
-      destination: path.join(patcherDetails.modsPath, file),
-  }));
-
-  instructions.push({
-    type: 'generatefile',
-    destination: path.join(patcherDetails.modsPath, FAKE_FILE),
-    data: new Buffer('generated via vortex'),
-  });
-
-  return Promise.resolve({ instructions });
-}
-
 function init(context: types.IExtensionContext) {
+  const isHarmonyPatcherGame = (gameId: string) => {
+    const gameInfo = getCurrentGameInfo(context);
+    if (gameInfo === undefined) {
+      // How the heck is this possible ?
+      return false;
+    }
+
+    const patcherDetails: IPatcherDetails = getPatcherDetails(gameInfo.game);
+    return (patcherDetails !== undefined);
+  };
+
   const getPath = (game: types.IGame) => {
     const discoveryPath: string = getDiscoveryPath(context, game.id);
     return (discoveryPath !== undefined) ? discoveryPath : undefined;
   };
 
-  context.registerModType('harmonypatchermod', 25, () => true, getPath,
+  context.registerModType('harmonypatchermod', 25, isHarmonyPatcherGame, getPath,
     (instructions: types.IInstruction[]) => test(instructions, context));
 
   context.registerMerge(canMerge,
     (filePath: string, mergeDir: string) =>
       merge(filePath, mergeDir, context), 'harmonypatchermod');
 
-  context.registerInstaller('harmonypatchermod', 25,
-    (files: string[], gameId: string) => testInstaller(files, gameId, context),
-    (files: string[], destinationPath: string,
-     gameId: string, progressDelegate: types.ProgressDelegate) =>
-      install(files, destinationPath, gameId, progressDelegate, context));
+  context.once(() => {
+    context.api.onAsync('will-deploy', (profileId: string, deployment: IDeployment) => {
+      const state: types.IState = context.api.store.getState();
+      const profile = state.persistent.profiles[profileId];
+      const gameInfo = getCurrentGameInfo(context);
+      if (gameInfo === undefined) {
+        return Promise.resolve();
+      }
+
+      const patcherDetails: IPatcherDetails = getPatcherDetails(gameInfo.game);
+      if (patcherDetails === undefined) {
+        return Promise.resolve();
+      }
+
+      return new Promise(resolve => {
+        return ensureHarmonyMod(context.api, profile)
+        .then(modId => {
+          if ((util.getSafe(state, ['mods', modId], undefined) !== undefined)
+            && !util.getSafe(profile, ['modState', modId, 'enabled'], true)) {
+            // if the data mod is known but disabled, don't update it and most importantly:
+            //  don't activate it after deployment, that's probably not what the user wants
+            return resolve();
+          }
+
+          context.api.store.dispatch(actions.setModEnabled(profile.id, modId, true));
+          return resolve();
+        });
+      });
+    });
+  });
 
   return true;
 }
