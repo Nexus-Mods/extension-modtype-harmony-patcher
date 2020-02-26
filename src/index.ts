@@ -204,8 +204,7 @@ function init(context: types.IExtensionContext) {
         return Promise.resolve();
       }
 
-      return new Promise(resolve => {
-        return ensureHarmonyMod(context.api, profile)
+      return new Promise(resolve => ensureHarmonyMod(context.api, profile)
         .then(modId => {
           if ((util.getSafe(state, ['mods', modId], undefined) !== undefined)
             && !util.getSafe(profile, ['modState', modId, 'enabled'], true)) {
@@ -216,8 +215,7 @@ function init(context: types.IExtensionContext) {
 
           context.api.store.dispatch(actions.setModEnabled(profile.id, modId, true));
           return resolve();
-        });
-      });
+        }));
     });
   });
 
