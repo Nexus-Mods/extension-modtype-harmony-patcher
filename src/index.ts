@@ -85,7 +85,7 @@ function merge(filePath: string,
   //  getGameAssemblies will return only non-symlinks.
   const getGameAssemblies = (unityDataPath: string): Promise<string[]> => {
     return fs.readdirAsync(unityEnginePath)
-      .then(entries => {
+      .then((entries: string[]) => {
         const filtered = entries.filter(entry => entry.endsWith('.dll'));
         return Promise.reduce(filtered, (accumulator, entry) => {
           return fs.lstatAsync(path.join(unityDataPath, entry))
