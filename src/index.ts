@@ -22,15 +22,16 @@ function getCurrentGameInfo(context: types.IExtensionContext): IGameStoredInfo {
     return undefined;
   }
 
+  const profile: types.IProfile = selectors.activeProfile(state);
   const game: types.IGameStored = selectors.currentGame(state);
-  if (game === undefined) {
+  if (game === undefined || (game.id !== profile?.gameId)) {
     return undefined;
   }
 
   const discovery: types.IDiscoveryResult = util.getSafe(state,
     ['settings', 'gameMode', 'discovered', game.id], undefined);
 
-  if ((discovery === undefined) || (discovery.path === undefined)) {
+  if (discovery?.path === undefined) {
       return undefined;
   }
 
@@ -49,7 +50,8 @@ function test(instructions: types.IInstruction[],
     return Promise.resolve(false);
   }
 
-  const isHarmonyPatcherMod = instructions.find((instr: types.IInstruction) =>
+  const filtered = instructions.filter(instr => !!instr?.source);
+  const isHarmonyPatcherMod = filtered.find((instr: types.IInstruction) =>
     instr.source.indexOf(FAKE_FILE) !== -1) !== undefined;
 
   return Promise.resolve(isHarmonyPatcherMod);
