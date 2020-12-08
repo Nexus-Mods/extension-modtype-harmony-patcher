@@ -120,11 +120,25 @@ function merge(filePath: string,
                                                               && !res[2].includes(x)));
         return Promise.resolve(diff);
       })
-      .then(assemblies => (assemblies.length > 0)
-        ? Promise.each(assemblies, assembly =>
+      .then(assemblies => {
+        const copiedAssemblies: string[] = [];
+        return Promise.each(assemblies || [], assembly =>
           fs.copyAsync(path.join(MODULE_PATH, assembly),
-                       path.join(mergeDir, relDataPath, assembly)))
-        : Promise.resolve([]));
+                       path.join(mergeDir, relDataPath, assembly))
+            .tap(() => copiedAssemblies.push(path.join(mergeDir, relDataPath, assembly))))
+        .catch(err => {
+          // We were not able to copy over the required assemblies.
+          //  Cleanup might be needed.
+          log('error', 'failed to copy required Harmony patcher assembly', err.message);
+          return Promise.each(copiedAssemblies, assembly => fs.removeAsync(assembly))
+            .then(() => Promise.reject(err)) // Cleanup successful, error still needs forwarding
+            .catch(err2 => {
+              // Cleanup failed
+              log('warn', 'failed to clean up copied assemblies', err2.message);
+              return Promise.reject(err);
+            });
+        });
+      });
   };
 
   const patcherDetails: IPatcherDetails = getPatcherDetails(gameInfo.game);
@@ -141,7 +155,10 @@ function merge(filePath: string,
                            modsPath,
                            context as any,
                            patcherDetails.injectVIGO,
-                           unityEnginePath));
+                           unityEnginePath))
+    .catch(err => (err instanceof util.UserCanceled)
+      ? Promise.resolve()
+      : Promise.reject(err));
 }
 
 function canMerge(game: types.IGame, gameDiscovery: types.IDiscoveryResult): types.IMergeFilter {

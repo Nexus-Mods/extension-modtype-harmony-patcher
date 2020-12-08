@@ -1,6 +1,6 @@
 {
   "name": "modtype-harmony-patcher",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Functionality to automatically add/remove patch on deploy/purge",
   "main": "./out/index.js",
   "repository": "",
